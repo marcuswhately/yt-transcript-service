@@ -1,14 +1,34 @@
+import os
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
 
-# latest usage: create an INSTANCE and call instance methods .fetch() / .list()
 from youtube_transcript_api import (
-    YouTubeTranscriptApi,            # class to instantiate
+    YouTubeTranscriptApi,  # instance API
     TranscriptsDisabled,
     NoTranscriptFound,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig  # <— use generic proxies
 
 app = Flask(__name__)
+
+# ----- Bright Data proxy config from env -----
+BD_PROXY_HOST = os.environ.get("BD_PROXY_HOST")
+BD_PROXY_PORT = os.environ.get("BD_PROXY_PORT")
+BD_PROXY_USER = os.environ.get("BD_PROXY_USER")
+BD_PROXY_PASS = os.environ.get("BD_PROXY_PASS")
+
+def build_brightdata_proxy():
+    """
+    Build a GenericProxyConfig for Bright Data superproxy.
+    Use 'http://' for both http_url and https_url (HTTP CONNECT handles HTTPS).
+    """
+    if not (BD_PROXY_HOST and BD_PROXY_PORT and BD_PROXY_USER and BD_PROXY_PASS):
+        return None
+
+    auth = f"{BD_PROXY_USER}:{BD_PROXY_PASS}"
+    base = f"http://{auth}@{BD_PROXY_HOST}:{BD_PROXY_PORT}"
+    # Most providers expect http scheme for both; CONNECT will tunnel HTTPS.
+    return GenericProxyConfig(http_url=base, https_url=base)
 
 def extract_video_id(url: str):
     p = urlparse(url)
@@ -43,7 +63,9 @@ def fetch_segments_latest(video_id: str, target_lang: str = "en"):
       2) fetched = transcript.fetch() -> FetchedTranscript
       3) return raw snippets + language + whether translated
     """
-    ytt = YouTubeTranscriptApi()
+
+    proxy_cfg = build_brightdata_proxy()
+ytt = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi()
 
     prefer = [target_lang, "en", "en-GB", "en-US"]
 
