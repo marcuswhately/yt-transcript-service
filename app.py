@@ -2,16 +2,20 @@ import os
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
 
+# youtube-transcript-api (latest, instance API)
 from youtube_transcript_api import (
-    YouTubeTranscriptApi,  # instance API
+    YouTubeTranscriptApi,     # instantiate and call .list() / .fetch()
     TranscriptsDisabled,
     NoTranscriptFound,
 )
-from youtube_transcript_api.proxies import GenericProxyConfig  # <— use generic proxies
+from youtube_transcript_api.proxies import GenericProxyConfig
+
+# (for /proxycheck diagnostic)
+import requests
 
 app = Flask(__name__)
 
-# ----- Bright Data proxy config from env -----
+# ---------- Bright Data proxy config via env ----------
 BD_PROXY_HOST = os.environ.get("BD_PROXY_HOST")
 BD_PROXY_PORT = os.environ.get("BD_PROXY_PORT")
 BD_PROXY_USER = os.environ.get("BD_PROXY_USER")
@@ -20,14 +24,13 @@ BD_PROXY_PASS = os.environ.get("BD_PROXY_PASS")
 def build_brightdata_proxy():
     """
     Build a GenericProxyConfig for Bright Data superproxy.
-    Use 'http://' for both http_url and https_url (HTTP CONNECT handles HTTPS).
+    Use 'http://' for both HTTP and HTTPS (CONNECT will tunnel TLS).
+    Example resulting URL: http://USER:PASS@brd.superproxy.io:33335
     """
     if not (BD_PROXY_HOST and BD_PROXY_PORT and BD_PROXY_USER and BD_PROXY_PASS):
         return None
-
     auth = f"{BD_PROXY_USER}:{BD_PROXY_PASS}"
     base = f"http://{auth}@{BD_PROXY_HOST}:{BD_PROXY_PORT}"
-    # Most providers expect http scheme for both; CONNECT will tunnel HTTPS.
     return GenericProxyConfig(http_url=base, https_url=base)
 
 def extract_video_id(url: str):
@@ -46,49 +49,42 @@ def extract_video_id(url: str):
     return None
 
 def flatten_text_from_fetched(fetched):
-    """
-    fetched is a FetchedTranscript (iterable of FetchedTranscriptSnippet)
-    Safe way: use .to_raw_data() -> list of dicts {text, start, duration}
-    """
+    # fetched is FetchedTranscript; convert to list of dicts
     raw = fetched.to_raw_data()
-    return " ".join((d.get("text", "") or "").replace("\n", " ").strip() for d in raw).strip()
+    return " ".join((d.get("text", "") or "").replace("\n", " ").strip() for d in raw).strip(), raw
 
-def fetch_segments_latest(video_id: str, target_lang: str = "en"):
+def fetch_with_instance(video_id: str, target_lang: str = "en"):
     """
-    Latest API flow per README:
+    Latest API flow:
       1) ytt.list(video_id) -> TranscriptList
          - try human transcript in [target_lang, en, en-GB, en-US]
          - try generated transcript in those languages
          - else take first available and attempt translate(target_lang)
-      2) fetched = transcript.fetch() -> FetchedTranscript
-      3) return raw snippets + language + whether translated
+      2) t.fetch() -> FetchedTranscript
     """
-
     proxy_cfg = build_brightdata_proxy()
-ytt = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi()
+    ytt = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi()
 
     prefer = [target_lang, "en", "en-GB", "en-US"]
+    tl = ytt.list(video_id)  # TranscriptList
 
-    # 1) list available transcripts
-    tl = ytt.list(video_id)
-
-    # try human English-ish (or target_lang)
+    # human captions first
     try:
         t = tl.find_transcript(prefer)
         fetched = t.fetch()
-        return fetched, getattr(t, "language_code", "en"), False
+        return fetched, getattr(t, "language_code", "en"), False, bool(proxy_cfg)
     except Exception:
         pass
 
-    # try auto-generated
+    # auto-generated captions
     try:
         t = tl.find_generated_transcript(prefer)
         fetched = t.fetch()
-        return fetched, getattr(t, "language_code", "en"), False
+        return fetched, getattr(t, "language_code", "en"), False, bool(proxy_cfg)
     except Exception:
         pass
 
-    # pick first available, attempt translation to target_lang
+    # first available + try translation
     it = iter(tl)
     try:
         t = next(it)
@@ -103,15 +99,50 @@ ytt = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTran
             translated = True
             lang = target_lang
         except Exception:
-            # not translatable; proceed in original language
             pass
 
     fetched = t.fetch()
-    return fetched, lang, translated
+    return fetched, lang, translated, bool(proxy_cfg)
 
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
+
+@app.route("/debug")
+def debug():
+    # Let you confirm proxy envs are present and what URL will be used
+    proxy_cfg = build_brightdata_proxy()
+    return jsonify({
+        "has_proxy_env": bool(BD_PROXY_HOST and BD_PROXY_PORT and BD_PROXY_USER and BD_PROXY_PASS),
+        "proxy_http_url": getattr(proxy_cfg, "http_url", None) if proxy_cfg else None,
+        "proxy_https_url": getattr(proxy_cfg, "https_url", None) if proxy_cfg else None,
+    })
+
+@app.route("/proxycheck")
+def proxycheck():
+    """
+    Calls Bright Data's test endpoint THROUGH the same proxy to verify billing/usage.
+    You should see this hit on your Bright Data dashboard.
+    """
+    proxy_cfg = build_brightdata_proxy()
+    if not proxy_cfg:
+        return jsonify({"error": "Proxy env vars not set"}), 400
+
+    proxies = {
+        "http": proxy_cfg.http_url,
+        "https": proxy_cfg.https_url,
+    }
+    # The test endpoint you shared:
+    test_url = "https://geo.brdtest.com/welcome.txt?product=resi&method=native"
+    try:
+        r = requests.get(test_url, proxies=proxies, timeout=20)
+        return jsonify({
+            "status_code": r.status_code,
+            "text": r.text[:500],  # preview
+            "proxied_via": proxies
+        })
+    except Exception as e:
+        return jsonify({"error": f"Proxy test failed: {e}", "proxied_via": proxies}), 502
 
 @app.route("/transcript")
 def transcript():
@@ -126,26 +157,24 @@ def transcript():
         return jsonify({"error": "Could not parse video id"}), 400
 
     try:
-        fetched, used_lang, translated = fetch_segments_latest(vid, target_lang=target_lang)
-        text = flatten_text_from_fetched(fetched)
+        fetched, used_lang, translated, proxy_used = fetch_with_instance(vid, target_lang=target_lang)
+        text, raw = flatten_text_from_fetched(fetched)
         if not text or len(text.split()) < 10:
             return jsonify({"error": "No transcript available"}), 404
 
-        # also return raw list of dicts if you want to chunk later
-        raw = fetched.to_raw_data()
         return jsonify({
             "videoId": vid,
             "language": used_lang,
             "translatedTo": target_lang if translated else None,
             "text": text,
-            "segments": raw
+            "segments": raw,
+            "proxy_used": proxy_used
         })
     except (TranscriptsDisabled, NoTranscriptFound):
         return jsonify({"error": "No transcript available"}), 404
     except Exception as e:
-        # Render/Cloud IPs can be blocked by YouTube; library raises RequestBlocked/IpBlocked
+        # If YouTube blocks cloud IPs or proxies, the lib raises RequestBlocked/IpBlocked
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    # local only; Render uses gunicorn
     app.run(host="0.0.0.0", port=10000)
