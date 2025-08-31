@@ -1,15 +1,13 @@
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
 
-# Import exceptions; not all versions export the same extra names,
-# but these two are stable and enough for control flow.
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+# Import the module and the two stable exceptions
+import youtube_transcript_api as yta_mod
+from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
 
-# Try to get the installed version for debugging.
-try:
-    from youtube_transcript_api import __version__ as yta_version
-except Exception:
-    yta_version = "unknown"
+# Grab symbols safely (some versions differ)
+YouTubeTranscriptApi = getattr(yta_mod, "YouTubeTranscriptApi", None)
+yta_version = getattr(yta_mod, "__version__", "unknown")
 
 app = Flask(__name__)
 
@@ -29,23 +27,23 @@ def extract_video_id(url: str):
     return None
 
 def flatten_text(segments):
-    # segments: list of dicts like {"text": "...", "start": ..., "duration": ...}
     return " ".join((s.get("text", "") or "").replace("\n", " ").strip() for s in segments).strip()
 
 def fetch_segments_adaptive(video_id: str, target_lang: str = "en"):
     """
-    Works across multiple youtube-transcript-api versions:
-    1) If `list_transcripts` exists:
-       - try human English
-       - try generated English
-       - else first available, try translate to target_lang
-    2) Else (older API): fall back to `get_transcript` (English prefs, then any)
-    Returns: (segments, used_language_code, translated_bool)
+    Adapt to different library surfaces:
+    - Preferred: class with list_transcripts/find_transcript/find_generated_transcript/translate
+    - Fallback: class with get_transcript(...)
     """
+    if YouTubeTranscriptApi is None:
+        raise RuntimeError("YouTubeTranscriptApi symbol not found in youtube_transcript_api module")
+
+    has_list = hasattr(YouTubeTranscriptApi, "list_transcripts")
+    has_get = hasattr(YouTubeTranscriptApi, "get_transcript")
+
     prefer_en = ["en", "en-GB", "en-US"]
 
-    if hasattr(YouTubeTranscriptApi, "list_transcripts"):
-        # Newer API surface
+    if has_list:
         tl = YouTubeTranscriptApi.list_transcripts(video_id)
 
         # 1) human English
@@ -62,7 +60,7 @@ def fetch_segments_adaptive(video_id: str, target_lang: str = "en"):
         except Exception:
             pass
 
-        # 3) first available; attempt translation to target_lang if possible
+        # 3) first available; try translation
         try:
             t = next(iter(tl))
         except StopIteration:
@@ -76,24 +74,21 @@ def fetch_segments_adaptive(video_id: str, target_lang: str = "en"):
                 translated = True
                 lang = target_lang
             except Exception:
-                # translation not available; keep original
                 pass
 
         return t.fetch(), lang, translated
 
-    # Fallback: older API that exposes `get_transcript`
-    if hasattr(YouTubeTranscriptApi, "get_transcript"):
+    if has_get:
+        # Older API surface
         try:
             segs = YouTubeTranscriptApi.get_transcript(video_id, languages=prefer_en)
             return segs, "en", False
         except Exception:
             segs = YouTubeTranscriptApi.get_transcript(video_id)
-            # Language key may not exist; this is best-effort
             lang = segs[0].get("lang", "") if segs and isinstance(segs[0], dict) else ""
             return segs, lang, False
 
-    # If neither method exists, the installed lib is unexpected
-    raise RuntimeError("youtube-transcript-api installation does not expose known methods.")
+    raise RuntimeError("youtube-transcript-api has neither list_transcripts nor get_transcript")
 
 @app.route("/health")
 def health():
@@ -101,12 +96,15 @@ def health():
 
 @app.route("/debug")
 def debug():
-    methods = {
-        "has_list_transcripts": hasattr(YouTubeTranscriptApi, "list_transcripts"),
-        "has_get_transcript": hasattr(YouTubeTranscriptApi, "get_transcript"),
+    info = {
         "yta_version": yta_version,
+        "module_dir_sample": sorted([n for n in dir(yta_mod) if not n.startswith("_")])[:20],
+        "has_class_symbol": YouTubeTranscriptApi is not None,
+        "class_type": type(YouTubeTranscriptApi).__name__ if YouTubeTranscriptApi is not None else None,
+        "class_has_list_transcripts": hasattr(YouTubeTranscriptApi, "list_transcripts") if YouTubeTranscriptApi is not None else None,
+        "class_has_get_transcript": hasattr(YouTubeTranscriptApi, "get_transcript") if YouTubeTranscriptApi is not None else None,
     }
-    return jsonify(methods)
+    return jsonify(info)
 
 @app.route("/transcript")
 def transcript():
@@ -139,5 +137,4 @@ def transcript():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    # local only; Render uses gunicorn
     app.run(host="0.0.0.0", port=10000)
