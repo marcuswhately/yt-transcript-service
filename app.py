@@ -2,36 +2,37 @@ import os
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
 
-# youtube-transcript-api (latest, instance API)
+# youtube-transcript-api (current, instance API)
 from youtube_transcript_api import (
     YouTubeTranscriptApi,     # instantiate and call .list() / .fetch()
     TranscriptsDisabled,
     NoTranscriptFound,
 )
-from youtube_transcript_api.proxies import GenericProxyConfig
+from youtube_transcript_api.proxies import WebshareProxyConfig  # <— built-in Webshare support
 
-# (for /proxycheck diagnostic)
-import requests
+import requests  # only used for the /proxycheck diagnostic
 
 app = Flask(__name__)
 
-# ---------- Bright Data proxy config via env ----------
-BD_PROXY_HOST = os.environ.get("BD_PROXY_HOST")
-BD_PROXY_PORT = os.environ.get("BD_PROXY_PORT")
-BD_PROXY_USER = os.environ.get("BD_PROXY_USER")
-BD_PROXY_PASS = os.environ.get("BD_PROXY_PASS")
+# ---------- Webshare proxy config via env ----------
+WS_USER = os.environ.get("WEBSHARE_PROXY_USERNAME")
+WS_PASS = os.environ.get("WEBSHARE_PROXY_PASSWORD")
+# Optional: bias IPs to certain countries, e.g. "gb,de,us"
+WS_COUNTRIES = os.environ.get("WEBSHARE_COUNTRIES", "")
 
-def build_brightdata_proxy():
+def build_webshare_proxy():
     """
-    Build a GenericProxyConfig for Bright Data superproxy.
-    Use 'http://' for both HTTP and HTTPS (CONNECT will tunnel TLS).
-    Example resulting URL: http://USER:PASS@brd.superproxy.io:33335
+    Build a WebshareProxyConfig for youtube-transcript-api.
+    The library rotates residential proxies for you; no host/port to manage.
     """
-    if not (BD_PROXY_HOST and BD_PROXY_PORT and BD_PROXY_USER and BD_PROXY_PASS):
+    if not (WS_USER and WS_PASS):
         return None
-    auth = f"{BD_PROXY_USER}:{BD_PROXY_PASS}"
-    base = f"http://{auth}@{BD_PROXY_HOST}:{BD_PROXY_PORT}"
-    return GenericProxyConfig(http_url=base, https_url=base)
+    countries = [c.strip().lower() for c in WS_COUNTRIES.split(",") if c.strip()]
+    kwargs = {}
+    if countries:
+        # Ask Webshare for IPs from these countries (best-effort)
+        kwargs["filter_ip_locations"] = countries
+    return WebshareProxyConfig(proxy_username=WS_USER, proxy_password=WS_PASS, **kwargs)
 
 def extract_video_id(url: str):
     p = urlparse(url)
@@ -51,18 +52,19 @@ def extract_video_id(url: str):
 def flatten_text_from_fetched(fetched):
     # fetched is FetchedTranscript; convert to list of dicts
     raw = fetched.to_raw_data()
-    return " ".join((d.get("text", "") or "").replace("\n", " ").strip() for d in raw).strip(), raw
+    text = " ".join((d.get("text", "") or "").replace("\n", " ").strip() for d in raw).strip()
+    return text, raw
 
 def fetch_with_instance(video_id: str, target_lang: str = "en"):
     """
-    Latest API flow:
+    Latest API flow (per project README):
       1) ytt.list(video_id) -> TranscriptList
          - try human transcript in [target_lang, en, en-GB, en-US]
          - try generated transcript in those languages
-         - else take first available and attempt translate(target_lang)
+         - else pick first available and attempt translate(target_lang)
       2) t.fetch() -> FetchedTranscript
     """
-    proxy_cfg = build_brightdata_proxy()
+    proxy_cfg = build_webshare_proxy()
     ytt = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi()
 
     prefer = [target_lang, "en", "en-GB", "en-US"]
@@ -110,46 +112,40 @@ def health():
 
 @app.route("/debug")
 def debug():
-    # Let you confirm proxy envs are present and what URL will be used
-    proxy_cfg = build_brightdata_proxy()
+    proxy_cfg = build_webshare_proxy()
     return jsonify({
-        "has_proxy_env": bool(BD_PROXY_HOST and BD_PROXY_PORT and BD_PROXY_USER and BD_PROXY_PASS),
-        "proxy_http_url": getattr(proxy_cfg, "http_url", None) if proxy_cfg else None,
-        "proxy_https_url": getattr(proxy_cfg, "https_url", None) if proxy_cfg else None,
+        "webshare_configured": bool(proxy_cfg),
+        "preferred_countries": [c.strip().lower() for c in WS_COUNTRIES.split(",") if c.strip()],
     })
 
 @app.route("/proxycheck")
 def proxycheck():
     """
-    Calls Bright Data's test endpoint THROUGH the same proxy to verify billing/usage.
-    The Bright Data test host can present a cert chain that triggers verify errors;
-    since this is ONLY a connectivity test, we disable verification here.
-    This does NOT affect YouTube requests made by youtube-transcript-api.
+    Simple connectivity check through Webshare using requests (not the transcript lib).
+    We'll fetch a small public page and report status_code. This should also appear
+    on your Webshare usage dashboard.
     """
-    proxy_cfg = build_brightdata_proxy()
+    proxy_cfg = build_webshare_proxy()
     if not proxy_cfg:
-        return jsonify({"error": "Proxy env vars not set"}), 400
+        return jsonify({"error": "Webshare env vars not set"}), 400
 
-    proxies = {
-        "http": proxy_cfg.http_url,
-        "https": proxy_cfg.https_url,
-    }
-    test_url = "https://geo.brdtest.com/welcome.txt?product=resi&method=native"
+    # WebshareProxyConfig is internal to the library; for this diagnostic we just
+    # attempt a transcript API list() call, which WILL use the proxy.
+    test_vid = request.args.get("video_id", "dQw4w9WgXcQ")
     try:
-        r = requests.get(
-            test_url,
-            proxies=proxies,
-            timeout=20,
-            verify=False,               # <— ignore TLS just for this diagnostic call
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        return jsonify({
-            "status_code": r.status_code,
-            "text": r.text[:500],
-            "proxied_via": proxies
-        })
+        ytt = YouTubeTranscriptApi(proxy_config=proxy_cfg)
+        _ = ytt.list(test_vid)  # if this succeeds, proxy is in use
+        ok = True
     except Exception as e:
-        return jsonify({"error": f"Proxy test failed: {e}", "proxied_via": proxies}), 502
+        ok = False
+        err = str(e)
+
+    return jsonify({
+        "webshare_configured": True,
+        "probe_video_id": test_vid,
+        "list_ok": ok,
+        "error": None if ok else err[:500],
+    }), (200 if ok else 502)
 
 @app.route("/transcript")
 def transcript():
@@ -180,7 +176,7 @@ def transcript():
     except (TranscriptsDisabled, NoTranscriptFound):
         return jsonify({"error": "No transcript available"}), 404
     except Exception as e:
-        # If YouTube blocks cloud IPs or proxies, the lib raises RequestBlocked/IpBlocked
+        # If YouTube blocks IPs, the lib raises RequestBlocked/IpBlocked/YouTubeRequestFailed
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 if __name__ == "__main__":
