@@ -1,13 +1,21 @@
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
 
-# Import the module and the two stable exceptions
+# Import the module and exceptions
 import youtube_transcript_api as yta_mod
 from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
 
-# Grab symbols safely (some versions differ)
+# Try to resolve symbols and version across variants
 YouTubeTranscriptApi = getattr(yta_mod, "YouTubeTranscriptApi", None)
-yta_version = getattr(yta_mod, "__version__", "unknown")
+mod_list_transcripts = getattr(yta_mod, "list_transcripts", None)      # module-level function (newer variants)
+mod_get_transcript  = getattr(yta_mod, "get_transcript", None)         # module-level function (older/easier path)
+
+# Try to read package version via importlib.metadata (works even if __version__ is missing)
+try:
+    from importlib.metadata import version as _pkg_version
+    yta_version = _pkg_version("youtube-transcript-api")
+except Exception:
+    yta_version = getattr(yta_mod, "__version__", "unknown")
 
 app = Flask(__name__)
 
@@ -29,66 +37,85 @@ def extract_video_id(url: str):
 def flatten_text(segments):
     return " ".join((s.get("text", "") or "").replace("\n", " ").strip() for s in segments).strip()
 
-def fetch_segments_adaptive(video_id: str, target_lang: str = "en"):
+def fetch_with_transcriptlist(tl, target_lang: str):
     """
-    Adapt to different library surfaces:
-    - Preferred: class with list_transcripts/find_transcript/find_generated_transcript/translate
-    - Fallback: class with get_transcript(...)
+    Given a TranscriptList (tl), try:
+      1) human English; 2) generated English; 3) first available + translate to target_lang if possible
     """
-    if YouTubeTranscriptApi is None:
-        raise RuntimeError("YouTubeTranscriptApi symbol not found in youtube_transcript_api module")
-
-    has_list = hasattr(YouTubeTranscriptApi, "list_transcripts")
-    has_get = hasattr(YouTubeTranscriptApi, "get_transcript")
-
     prefer_en = ["en", "en-GB", "en-US"]
 
-    if has_list:
+    # 1) human English
+    try:
+        t = tl.find_transcript(prefer_en)
+        return t.fetch(), getattr(t, "language_code", "en"), False
+    except Exception:
+        pass
+
+    # 2) generated English
+    try:
+        t = tl.find_generated_transcript(prefer_en)
+        return t.fetch(), getattr(t, "language_code", "en"), False
+    except Exception:
+        pass
+
+    # 3) first available, then attempt translation
+    it = iter(tl)
+    try:
+        t = next(it)
+    except StopIteration:
+        raise NoTranscriptFound("No transcripts listed for this video.")
+
+    lang = getattr(t, "language_code", "") or ""
+    translated = False
+    if target_lang and (not lang.startswith(target_lang)):
+        try:
+            t = t.translate(target_lang)
+            translated = True
+            lang = target_lang
+        except Exception:
+            pass
+
+    return t.fetch(), lang, translated
+
+def fetch_segments(video_id: str, target_lang: str = "en"):
+    """
+    Adaptive strategy across library variants:
+      A) Prefer module-level list_transcripts(...)  -> TranscriptList flow
+      B) Else, prefer class-level list_transcripts(...)
+      C) Else, try module-level get_transcript(...) (older but common)
+      D) Else, try class-level get_transcript(...)
+    """
+    # A) module-level list_transcripts
+    if callable(mod_list_transcripts):
+        tl = mod_list_transcripts(video_id)
+        return fetch_with_transcriptlist(tl, target_lang)
+
+    # B) class-level list_transcripts
+    if YouTubeTranscriptApi and hasattr(YouTubeTranscriptApi, "list_transcripts"):
         tl = YouTubeTranscriptApi.list_transcripts(video_id)
+        return fetch_with_transcriptlist(tl, target_lang)
 
-        # 1) human English
+    # C) module-level get_transcript
+    if callable(mod_get_transcript):
+        # Try English first, then any
         try:
-            t = tl.find_transcript(prefer_en)
-            return t.fetch(), getattr(t, "language_code", "en"), False
+            segs = mod_get_transcript(video_id, languages=["en", "en-GB", "en-US"])
         except Exception:
-            pass
+            segs = mod_get_transcript(video_id)
+        lang = segs[0].get("lang", "") if segs and isinstance(segs[0], dict) else ""
+        return segs, lang or "en", False
 
-        # 2) generated English
+    # D) class-level get_transcript
+    if YouTubeTranscriptApi and hasattr(YouTubeTranscriptApi, "get_transcript"):
         try:
-            t = tl.find_generated_transcript(prefer_en)
-            return t.fetch(), getattr(t, "language_code", "en"), False
-        except Exception:
-            pass
-
-        # 3) first available; try translation
-        try:
-            t = next(iter(tl))
-        except StopIteration:
-            raise NoTranscriptFound("No transcripts listed for this video.")
-
-        lang = getattr(t, "language_code", "") or ""
-        translated = False
-        if target_lang and (not lang.startswith(target_lang)):
-            try:
-                t = t.translate(target_lang)
-                translated = True
-                lang = target_lang
-            except Exception:
-                pass
-
-        return t.fetch(), lang, translated
-
-    if has_get:
-        # Older API surface
-        try:
-            segs = YouTubeTranscriptApi.get_transcript(video_id, languages=prefer_en)
-            return segs, "en", False
+            segs = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-GB", "en-US"])
         except Exception:
             segs = YouTubeTranscriptApi.get_transcript(video_id)
-            lang = segs[0].get("lang", "") if segs and isinstance(segs[0], dict) else ""
-            return segs, lang, False
+        lang = segs[0].get("lang", "") if segs and isinstance(segs[0], dict) else ""
+        return segs, lang or "en", False
 
-    raise RuntimeError("youtube-transcript-api has neither list_transcripts nor get_transcript")
+    # If none of the above exist, the install is seriously non-standard.
+    raise RuntimeError("youtube-transcript-api exposes neither list_transcripts nor get_transcript (module or class).")
 
 @app.route("/health")
 def health():
@@ -98,11 +125,13 @@ def health():
 def debug():
     info = {
         "yta_version": yta_version,
-        "module_dir_sample": sorted([n for n in dir(yta_mod) if not n.startswith("_")])[:20],
+        "module_has_list_transcripts": callable(mod_list_transcripts),
+        "module_has_get_transcript": callable(mod_get_transcript),
         "has_class_symbol": YouTubeTranscriptApi is not None,
-        "class_type": type(YouTubeTranscriptApi).__name__ if YouTubeTranscriptApi is not None else None,
-        "class_has_list_transcripts": hasattr(YouTubeTranscriptApi, "list_transcripts") if YouTubeTranscriptApi is not None else None,
-        "class_has_get_transcript": hasattr(YouTubeTranscriptApi, "get_transcript") if YouTubeTranscriptApi is not None else None,
+        "class_has_list_transcripts": hasattr(YouTubeTranscriptApi, "list_transcripts") if YouTubeTranscriptApi else None,
+        "class_has_get_transcript": hasattr(YouTubeTranscriptApi, "get_transcript") if YouTubeTranscriptApi else None,
+        # show more names so we can see the public surface on your server
+        "module_dir": [n for n in dir(yta_mod) if not n.startswith("_")],
     }
     return jsonify(info)
 
@@ -119,7 +148,7 @@ def transcript():
         return jsonify({"error": "Could not parse video id"}), 400
 
     try:
-        segments, used_lang, translated = fetch_segments_adaptive(vid, target_lang=target_lang)
+        segments, used_lang, translated = fetch_segments(vid, target_lang=target_lang)
         text = flatten_text(segments)
         if not text or len(text.split()) < 10:
             return jsonify({"error": "No transcript available"}), 404
