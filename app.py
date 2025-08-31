@@ -122,7 +122,9 @@ def debug():
 def proxycheck():
     """
     Calls Bright Data's test endpoint THROUGH the same proxy to verify billing/usage.
-    You should see this hit on your Bright Data dashboard.
+    The Bright Data test host can present a cert chain that triggers verify errors;
+    since this is ONLY a connectivity test, we disable verification here.
+    This does NOT affect YouTube requests made by youtube-transcript-api.
     """
     proxy_cfg = build_brightdata_proxy()
     if not proxy_cfg:
@@ -132,13 +134,18 @@ def proxycheck():
         "http": proxy_cfg.http_url,
         "https": proxy_cfg.https_url,
     }
-    # The test endpoint you shared:
     test_url = "https://geo.brdtest.com/welcome.txt?product=resi&method=native"
     try:
-        r = requests.get(test_url, proxies=proxies, timeout=20)
+        r = requests.get(
+            test_url,
+            proxies=proxies,
+            timeout=20,
+            verify=False,               # <— ignore TLS just for this diagnostic call
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         return jsonify({
             "status_code": r.status_code,
-            "text": r.text[:500],  # preview
+            "text": r.text[:500],
             "proxied_via": proxies
         })
     except Exception as e:
