@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, NoTranscriptAvailable
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from urllib.parse import urlparse, parse_qs
+
 import re
 
 app = Flask(__name__)
@@ -39,7 +40,7 @@ def transcript():
 
         text = " ".join([seg["text"].replace("\n"," ") for seg in transcript]).strip()
         return jsonify({"videoId": vid, "text": text})
-    except (TranscriptsDisabled, NoTranscriptFound, NoTranscriptAvailable):
+    except (TranscriptsDisabled, NoTranscriptFound):
         return jsonify({"error": "No transcript available"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
